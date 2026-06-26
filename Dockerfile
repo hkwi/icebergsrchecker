@@ -6,17 +6,18 @@ ARG http_proxy
 ARG https_proxy
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
+ARG MAVEN_OPTS
 
 ENV http_proxy=${http_proxy}
 ENV https_proxy=${https_proxy}
 ENV HTTP_PROXY=${HTTP_PROXY}
 ENV HTTPS_PROXY=${HTTPS_PROXY}
+ENV MAVEN_OPTS="${MAVEN_OPTS}"
 
 COPY pom.xml .
-COPY .mvn .mvn
 COPY src src
 
-RUN mvn -ntp -DskipTests package
+RUN mvn -ntp ${MAVEN_OPTS} -DskipTests package
 
 
 FROM eclipse-temurin:26-jre AS runtime
