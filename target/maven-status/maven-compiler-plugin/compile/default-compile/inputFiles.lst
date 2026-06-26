@@ -1,6 +1,0 @@
-/home/kawai/tmp/ib/src/main/java/io/github/hkwi/icebergsrchecker/SchemaPrecheckApplication.java
-/home/kawai/tmp/ib/src/main/java/io/github/hkwi/icebergsrchecker/api/SchemaCheckController.java
-/home/kawai/tmp/ib/src/main/java/io/github/hkwi/icebergsrchecker/api/SchemaCheckRequest.java
-/home/kawai/tmp/ib/src/main/java/io/github/hkwi/icebergsrchecker/api/SchemaCheckResponse.java
-/home/kawai/tmp/ib/src/main/java/io/github/hkwi/icebergsrchecker/api/SchemaIssue.java
-/home/kawai/tmp/ib/src/main/java/io/github/hkwi/icebergsrchecker/service/SchemaCheckerService.java
