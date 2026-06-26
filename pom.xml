@@ -19,7 +19,7 @@
 
     <properties>
         <java.version>21</java.version>
-        <confluent.version>7.7.0</confluent.version>
+        <confluent.version>8.3.0</confluent.version>
         <iceberg.version>1.11.0</iceberg.version>
     </properties>
 
