@@ -16,3 +16,4 @@ Thumbs.db
 # Environment files
 .env
 .env.*
+.mvn/jvm.config
