@@ -1,4 +1,4 @@
-FROM maven:3.9.8-eclipse-temurin-17 AS build
+FROM maven:3.9.15-eclipse-temurin-26 AS build
 
 WORKDIR /workspace
 
@@ -19,7 +19,7 @@ COPY src src
 RUN mvn -ntp -DskipTests package
 
 
-FROM eclipse-temurin:17-jre AS runtime
+FROM eclipse-temurin:26-jre AS runtime
 
 WORKDIR /app
 
