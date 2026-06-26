@@ -67,6 +67,22 @@ This is a web application that validates whether a schema is likely to be conver
 
    docker push your-registry/iceberg-sr-checker:latest
 
+### Tips: Building Behind a Proxy
+
+When building in an environment that requires a proxy, pass the proxy settings as build arguments:
+
+```sh
+docker build \
+  --build-arg=http_proxy=http://proxy.example.com:8080 \
+  --build-arg=https_proxy=http://proxy.example.com:8080 \
+  --build-arg=HTTP_PROXY=http://proxy.example.com:8080 \
+  --build-arg=HTTPS_PROXY=http://proxy.example.com:8080 \
+  --build-arg='MAVEN_OPTS=-Dmaven.resolver.transport=wagon -Dhttp.proxyHost=proxy.example.com -Dhttp.proxyPort=8080 -Dhttps.proxyHost=proxy.example.com -Dhttps.proxyPort=8080' \
+  -t your-registry/iceberg-sr-checker:latest .
+```
+
+`-Dmaven.resolver.transport=jdk` is not supported by the Maven image used here. Maven fails at startup with `Unknown resolver transport 'jdk'. Supported transports are: wagon, native, auto`.
+
 ## Testing
 
 Run tests with:
