@@ -30,11 +30,13 @@ public class SchemaCheckController {
                     0,
                     List.of(new SchemaIssue("request", "format and schema are required.")),
                     List.of(),
+                    null,
+                    null,
                     null
             );
             return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(response);
         }
-        return ResponseEntity.ok(checkerService.check(request.format(), request.schema()));
+        return ResponseEntity.ok(checkerService.check(request));
     }
 
     @GetMapping("/health")

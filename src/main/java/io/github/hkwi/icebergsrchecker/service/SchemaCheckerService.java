@@ -1,291 +1,553 @@
 package io.github.hkwi.icebergsrchecker.service;
 
-import io.github.hkwi.icebergsrchecker.api.SchemaCheckResponse;
-import io.github.hkwi.icebergsrchecker.api.SchemaIssue;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.protobuf.DynamicMessage;
+import com.google.protobuf.TextFormat;
+import com.google.protobuf.util.JsonFormat;
+import io.confluent.connect.avro.AvroData;
+import io.confluent.connect.avro.AvroDataConfig;
+import io.confluent.connect.json.JsonSchemaData;
+import io.confluent.connect.json.JsonSchemaDataConfig;
+import io.confluent.connect.protobuf.ProtobufData;
+import io.confluent.connect.protobuf.ProtobufDataConfig;
 import io.confluent.kafka.schemaregistry.avro.AvroSchema;
 import io.confluent.kafka.schemaregistry.json.JsonSchema;
 import io.confluent.kafka.schemaregistry.protobuf.ProtobufSchema;
-import org.apache.iceberg.Schema;
-import org.apache.iceberg.avro.AvroSchemaUtil;
-import org.apache.iceberg.types.Type;
-import org.apache.iceberg.types.Types;
-import org.springframework.stereotype.Service;
-
+import io.github.hkwi.icebergsrchecker.api.SchemaCheckRequest;
+import io.github.hkwi.icebergsrchecker.api.SchemaCheckResponse;
+import io.github.hkwi.icebergsrchecker.api.SchemaIssue;
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.nio.ByteBuffer;
+import java.nio.file.Path;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import org.apache.avro.generic.GenericDatumReader;
+import org.apache.avro.io.Decoder;
+import org.apache.avro.io.DecoderFactory;
+import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Schema;
+import org.apache.iceberg.data.GenericRecord;
+import org.apache.iceberg.data.Record;
+import org.apache.iceberg.data.parquet.GenericParquetWriter;
+import org.apache.iceberg.io.DataWriter;
+import org.apache.iceberg.parquet.Parquet;
+import org.apache.iceberg.types.Type;
+import org.apache.iceberg.types.Types;
+import org.apache.kafka.connect.data.Decimal;
+import org.apache.kafka.connect.data.SchemaAndValue;
+import org.apache.kafka.connect.data.Struct;
+import org.springframework.stereotype.Service;
 
 @Service
 public class SchemaCheckerService {
     private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final String VALUE_CONVERTER_PREFIX = "value.converter.";
 
     public SchemaCheckResponse check(String format, String schemaText) {
-        long start = System.currentTimeMillis();
+        return check(new SchemaCheckRequest(format, schemaText, null, null, false, Map.of()));
+    }
+
+    public SchemaCheckResponse check(SchemaCheckRequest request) {
+        long start = System.nanoTime();
         CheckContext ctx = new CheckContext();
+        String normalized = normalizeFormat(request.format());
+        ConnectInput connectInput = null;
         Schema icebergSchema = null;
+        Map<String, Object> parquetDryRun = null;
 
         try {
-            String normalized = normalizeFormat(format);
-            if ("avro".equals(normalized)) {
-                icebergSchema = checkAvro(schemaText, ctx);
-            } else if ("json-schema".equals(normalized)) {
-                icebergSchema = checkJsonSchema(schemaText, ctx);
-            } else if ("protobuf".equals(normalized)) {
-                icebergSchema = checkProtobuf(schemaText, ctx);
-            } else {
-                ctx.error("root", "Unsupported format: " + format);
-            }
+            connectInput = toConnectInput(normalized, request, ctx);
+            if (connectInput != null && ctx.errors.isEmpty()) {
+                Type rootType = toIcebergType(
+                        connectInput.schema(),
+                        ctx,
+                        Boolean.TRUE.equals(request.schemaForceOptional())
+                );
+                Types.StructType rootStruct = rootType.asStructType();
+                icebergSchema = new Schema(rootStruct.fields());
 
-            return new SchemaCheckResponse(
-                    ctx.errors.isEmpty(),
-                    normalized,
-                    System.currentTimeMillis() - start,
-                    List.copyOf(ctx.errors),
-                    List.copyOf(ctx.warnings),
-                    icebergSchema == null ? null : schemaToMap(icebergSchema)
-            );
+                Record record = connectInput.value() == null
+                        ? dummyRecord(rootStruct)
+                        : toRecord(rootStruct, connectInput.value());
+                parquetDryRun = runParquetDryRun(icebergSchema, record, connectInput.value() != null, ctx);
+            }
         } catch (Exception ex) {
-            ctx.error("root", "Parse error: " + ex.getMessage());
-            return new SchemaCheckResponse(
-                    false,
-                    normalizeFormat(format),
-                    System.currentTimeMillis() - start,
-                    List.copyOf(ctx.errors),
-                    List.copyOf(ctx.warnings),
-                    null
-            );
+            ctx.error("root", dryRunError(ex));
         }
+
+        return new SchemaCheckResponse(
+                ctx.errors.isEmpty(),
+                normalized,
+                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start),
+                List.copyOf(ctx.errors),
+                List.copyOf(ctx.warnings),
+                connectInput == null ? null : connectSchemaToMap(connectInput.schema()),
+                icebergSchema == null ? null : schemaToMap(icebergSchema),
+                parquetDryRun
+        );
     }
 
-    private Schema checkAvro(String schemaText, CheckContext ctx) {
+    private ConnectInput toConnectInput(String format, SchemaCheckRequest request, CheckContext ctx)
+            throws Exception {
+        Map<String, Object> converterConfig = converterConfig(request.converterConfig());
+        boolean hasSample = !isBlank(request.sampleValue());
+
+        return switch (format) {
+            case "avro" -> avroToConnect(
+                    request.schema(), request.sampleValue(), sampleFormat(request, "avro-json"), hasSample,
+                    converterConfig);
+            case "json-schema" -> jsonSchemaToConnect(
+                    request.schema(), request.sampleValue(), sampleFormat(request, "json"), hasSample,
+                    converterConfig);
+            case "protobuf" -> protobufToConnect(
+                    request.schema(), request.sampleValue(), sampleFormat(request, "protobuf-json"), hasSample,
+                    converterConfig);
+            default -> {
+                ctx.error("root", "Unsupported format: " + request.format());
+                yield null;
+            }
+        };
+    }
+
+    private ConnectInput avroToConnect(
+            String schemaText,
+            String sampleValue,
+            String sampleFormat,
+            boolean hasSample,
+            Map<String, Object> converterConfig
+    ) throws IOException {
         AvroSchema avroSchema = new AvroSchema(schemaText);
-        org.apache.avro.Schema rawSchema = avroSchema.rawSchema();
-        if (rawSchema.getType() != org.apache.avro.Schema.Type.RECORD) {
-            ctx.error("root", "Top-level Avro schema must be a record.");
-            return null;
-        }
-        return AvroSchemaUtil.toIceberg(rawSchema);
-    }
-
-    private Schema checkJsonSchema(String schemaText, CheckContext ctx) throws JsonProcessingException {
-        new JsonSchema(schemaText);
-        JsonNode root = MAPPER.readTree(schemaText);
-        if (!"object".equals(typeName(root))) {
-            ctx.error("root", "Top-level JSON Schema should be object for row mapping.");
-            return null;
-        }
-        List<Types.NestedField> fields = mapJsonObjectFields(root, "root", ctx);
-        return new Schema(fields);
-    }
-
-    private List<Types.NestedField> mapJsonObjectFields(JsonNode objectNode, String path, CheckContext ctx) {
-        JsonNode properties = objectNode.path("properties");
-        Set<String> required = new HashSet<>();
-        JsonNode requiredNode = objectNode.path("required");
-        if (requiredNode.isArray()) {
-            requiredNode.forEach(n -> required.add(n.asText()));
-        }
-
-        if (objectNode.has("oneOf") || objectNode.has("anyOf") || objectNode.has("allOf") || objectNode.has("$ref")) {
-            ctx.error(path, "JSON Schema combinators and $ref are not supported.");
-        }
-
-        List<Types.NestedField> fields = new ArrayList<>();
-        if (!properties.isObject()) {
-            return fields;
-        }
-        properties.fields().forEachRemaining(entry -> {
-            String fieldName = entry.getKey();
-            JsonNode node = entry.getValue();
-            String fieldPath = path + "." + fieldName;
-            Type fieldType = mapJsonType(node, fieldPath, ctx);
-            boolean isRequired = required.contains(fieldName);
-            Types.NestedField field = isRequired
-                    ? Types.NestedField.required(ctx.nextId(), fieldName, fieldType)
-                    : Types.NestedField.optional(ctx.nextId(), fieldName, fieldType);
-            fields.add(field);
-        });
-        return fields;
-    }
-
-    private Type mapJsonType(JsonNode node, String path, CheckContext ctx) {
-        String type = typeName(node);
-        if (type == null) {
-            ctx.error(path, "Unable to resolve JSON Schema type.");
-            return Types.StringType.get();
-        }
-
-        if ("string".equals(type)) {
-            return Types.StringType.get();
-        }
-        if ("boolean".equals(type)) {
-            return Types.BooleanType.get();
-        }
-        if ("integer".equals(type)) {
-            return Types.LongType.get();
-        }
-        if ("number".equals(type)) {
-            return Types.DoubleType.get();
-        }
-        if ("array".equals(type)) {
-            JsonNode item = node.path("items");
-            Type elementType = mapJsonType(item, path + "[]", ctx);
-            return Types.ListType.ofOptional(ctx.nextId(), elementType);
-        }
-        if ("object".equals(type)) {
-            if (node.has("patternProperties")) {
-                ctx.error(path, "patternProperties is not supported.");
+        AvroData avroData = new AvroData(new AvroDataConfig(converterConfig));
+        org.apache.kafka.connect.data.Schema connectSchema = avroData.toConnectSchema(avroSchema.rawSchema());
+        Object connectValue = null;
+        if (hasSample) {
+            if (!"avro-json".equals(sampleFormat)) {
+                throw new IllegalArgumentException("Avro sampleFormat must be avro-json.");
             }
-            List<Types.NestedField> fields = mapJsonObjectFields(node, path, ctx);
-            return Types.StructType.of(fields);
+            Object avroValue = parseAvroJson(avroSchema.rawSchema(), sampleValue);
+            SchemaAndValue schemaAndValue = avroData.toConnectData(avroSchema.rawSchema(), avroValue);
+            connectValue = schemaAndValue.value();
         }
-
-        ctx.error(path, "Unsupported JSON Schema type: " + type);
-        return Types.StringType.get();
+        return new ConnectInput(connectSchema, connectValue);
     }
 
-    private String typeName(JsonNode node) {
-        JsonNode type = node.path("type");
-        if (type.isTextual()) {
-            return type.asText();
-        }
-        if (type.isArray()) {
-            for (JsonNode part : type) {
-                if (!"null".equals(part.asText())) {
-                    return part.asText();
-                }
+    private ConnectInput jsonSchemaToConnect(
+            String schemaText,
+            String sampleValue,
+            String sampleFormat,
+            boolean hasSample,
+            Map<String, Object> converterConfig
+    ) throws JsonProcessingException {
+        JsonSchema jsonSchema = new JsonSchema(schemaText);
+        JsonSchemaData jsonSchemaData = new JsonSchemaData(new JsonSchemaDataConfig(converterConfig));
+        org.apache.kafka.connect.data.Schema connectSchema = jsonSchemaData.toConnectSchema(jsonSchema);
+        Object connectValue = null;
+        if (hasSample) {
+            if (!"json".equals(sampleFormat)) {
+                throw new IllegalArgumentException("JSON Schema sampleFormat must be json.");
             }
+            JsonNode jsonValue = MAPPER.readTree(sampleValue);
+            connectValue = jsonSchemaData.toConnectData(connectSchema, jsonValue);
         }
-        return null;
+        return new ConnectInput(connectSchema, connectValue);
     }
 
-    private Schema checkProtobuf(String schemaText, CheckContext ctx) {
+    private ConnectInput protobufToConnect(
+            String schemaText,
+            String sampleValue,
+            String sampleFormat,
+            boolean hasSample,
+            Map<String, Object> converterConfig
+    ) throws Exception {
         ProtobufSchema protobufSchema = new ProtobufSchema(schemaText);
-        com.google.protobuf.Descriptors.Descriptor descriptor;
-        try {
-            descriptor = protobufSchema.toDescriptor();
-        } catch (Exception ex) {
-            ctx.error("root", "Unable to parse protobuf descriptor: " + ex.getMessage());
-            return null;
-        }
-        Types.StructType rootType = mapDescriptor(descriptor, "root." + descriptor.getName(), ctx, new HashSet<>());
-        return new Schema(rootType.fields());
-    }
-
-    private Types.StructType mapDescriptor(
-            com.google.protobuf.Descriptors.Descriptor descriptor,
-            String path,
-            CheckContext ctx,
-            Set<String> seen
-    ) {
-        if (!seen.add(descriptor.getFullName())) {
-            ctx.error(path, "Recursive protobuf type is not supported: " + descriptor.getFullName());
-            return Types.StructType.of(List.of());
-        }
-
-        List<Types.NestedField> fields = new ArrayList<>();
-        for (com.google.protobuf.Descriptors.FieldDescriptor field : descriptor.getFields()) {
-            String fieldPath = path + "." + field.getName();
-            Type type = mapProtoFieldType(field, fieldPath, ctx, new HashSet<>(seen));
-            fields.add(Types.NestedField.optional(ctx.nextId(), field.getName(), type));
-        }
-
-        return Types.StructType.of(fields);
-    }
-
-    private Type mapProtoFieldType(
-            com.google.protobuf.Descriptors.FieldDescriptor field,
-            String path,
-            CheckContext ctx,
-            Set<String> seen
-    ) {
-        if (field.isMapField()) {
-            com.google.protobuf.Descriptors.FieldDescriptor valueField = field.getMessageType().findFieldByName("value");
-            if (valueField == null) {
-                ctx.error(path, "Unsupported protobuf map type.");
-                return Types.MapType.ofOptional(ctx.nextId(), ctx.nextId(), Types.StringType.get(), Types.StringType.get());
+        ProtobufData protobufData = new ProtobufData(new ProtobufDataConfig(converterConfig));
+        org.apache.kafka.connect.data.Schema connectSchema = protobufData.toConnectSchema(protobufSchema);
+        Object connectValue = null;
+        if (hasSample) {
+            DynamicMessage.Builder builder = DynamicMessage.newBuilder(protobufSchema.toDescriptor());
+            if ("protobuf-json".equals(sampleFormat)) {
+                JsonFormat.parser().merge(sampleValue, builder);
+            } else if ("protobuf-text".equals(sampleFormat)) {
+                TextFormat.getParser().merge(sampleValue, builder);
+            } else {
+                throw new IllegalArgumentException(
+                        "Protobuf sampleFormat must be protobuf-json or protobuf-text.");
             }
-            Type valueType = scalarProtoType(valueField, path + "{}", ctx, seen);
-            return Types.MapType.ofOptional(ctx.nextId(), ctx.nextId(), Types.StringType.get(), valueType);
+            SchemaAndValue schemaAndValue = protobufData.toConnectData(protobufSchema, builder.build());
+            connectValue = schemaAndValue.value();
         }
-
-        Type scalar = scalarProtoType(field, path, ctx, seen);
-        if (field.isRepeated()) {
-            return Types.ListType.ofOptional(ctx.nextId(), scalar);
-        }
-        return scalar;
+        return new ConnectInput(connectSchema, connectValue);
     }
 
-    private Type scalarProtoType(
-            com.google.protobuf.Descriptors.FieldDescriptor field,
-            String path,
+    private Object parseAvroJson(org.apache.avro.Schema schema, String json) throws IOException {
+        GenericDatumReader<Object> reader = new GenericDatumReader<>(schema);
+        Decoder decoder = DecoderFactory.get().jsonDecoder(schema, json);
+        return reader.read(null, decoder);
+    }
+
+    private Type toIcebergType(
+            org.apache.kafka.connect.data.Schema valueSchema,
             CheckContext ctx,
-            Set<String> seen
+            boolean schemaForceOptional
     ) {
-        return switch (field.getType()) {
-            case STRING -> Types.StringType.get();
-            case BOOL -> Types.BooleanType.get();
-            case BYTES -> Types.BinaryType.get();
-            case DOUBLE -> Types.DoubleType.get();
-            case FLOAT -> Types.FloatType.get();
-            case INT32, SINT32, SFIXED32 -> Types.IntegerType.get();
-            case INT64, SINT64, SFIXED64 -> Types.LongType.get();
-            case UINT32, FIXED32, UINT64, FIXED64 -> {
-                ctx.warning(path, "Unsigned/fixed protobuf integer is mapped to Iceberg long.");
+        return switch (valueSchema.type()) {
+            case BOOLEAN -> Types.BooleanType.get();
+            case BYTES -> {
+                if (Decimal.LOGICAL_NAME.equals(valueSchema.name())) {
+                    int scale = Integer.parseInt(valueSchema.parameters().get(Decimal.SCALE_FIELD));
+                    yield Types.DecimalType.of(38, scale);
+                }
+                yield Types.BinaryType.get();
+            }
+            case INT8, INT16 -> Types.IntegerType.get();
+            case INT32 -> {
+                if (org.apache.kafka.connect.data.Date.LOGICAL_NAME.equals(valueSchema.name())) {
+                    yield Types.DateType.get();
+                } else if (org.apache.kafka.connect.data.Time.LOGICAL_NAME.equals(valueSchema.name())) {
+                    yield Types.TimeType.get();
+                }
+                yield Types.IntegerType.get();
+            }
+            case INT64 -> {
+                if (org.apache.kafka.connect.data.Timestamp.LOGICAL_NAME.equals(valueSchema.name())) {
+                    yield Types.TimestampType.withZone();
+                }
                 yield Types.LongType.get();
             }
-            case ENUM -> {
-                ctx.warning(path, "Enum is mapped to Iceberg string.");
-                yield Types.StringType.get();
+            case FLOAT32 -> Types.FloatType.get();
+            case FLOAT64 -> Types.DoubleType.get();
+            case ARRAY -> {
+                Type elementType = toIcebergType(valueSchema.valueSchema(), ctx, schemaForceOptional);
+                boolean optional = schemaForceOptional || valueSchema.valueSchema().isOptional();
+                yield optional
+                        ? Types.ListType.ofOptional(ctx.nextId(), elementType)
+                        : Types.ListType.ofRequired(ctx.nextId(), elementType);
             }
-            default -> {
-                if (field.getType() == com.google.protobuf.Descriptors.FieldDescriptor.Type.MESSAGE) {
-                    yield mapDescriptor(field.getMessageType(), path, ctx, seen);
+            case MAP -> {
+                Type keyType = toIcebergType(valueSchema.keySchema(), ctx, schemaForceOptional);
+                Type valueType = toIcebergType(valueSchema.valueSchema(), ctx, schemaForceOptional);
+                boolean optional = schemaForceOptional || valueSchema.valueSchema().isOptional();
+                yield optional
+                        ? Types.MapType.ofOptional(ctx.nextId(), ctx.nextId(), keyType, valueType)
+                        : Types.MapType.ofRequired(ctx.nextId(), ctx.nextId(), keyType, valueType);
+            }
+            case STRUCT -> {
+                List<Types.NestedField> structFields = valueSchema.fields().stream()
+                        .map(field -> Types.NestedField.builder()
+                                .isOptional(schemaForceOptional || field.schema().isOptional())
+                                .withId(ctx.nextId())
+                                .ofType(toIcebergType(field.schema(), ctx, schemaForceOptional))
+                                .withName(field.name())
+                                .build())
+                        .collect(Collectors.toList());
+                yield Types.StructType.of(structFields);
+            }
+            case STRING -> {
+                if ("uuid".equals(valueSchema.name())) {
+                    yield Types.UUIDType.get();
                 }
-                ctx.error(path, "Unsupported protobuf type: " + field.getType());
                 yield Types.StringType.get();
             }
         };
+    }
+
+    private Map<String, Object> runParquetDryRun(
+            Schema icebergSchema,
+            Record record,
+            boolean sampleValueUsed,
+            CheckContext ctx
+    ) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("sampleValueUsed", sampleValueUsed);
+        result.put("recordSource", sampleValueUsed ? "sampleValue" : "synthetic");
+
+        Path file = null;
+        try {
+            file = java.nio.file.Files.createTempFile("iceberg-sr-checker-", ".parquet");
+            java.nio.file.Files.deleteIfExists(file);
+            DataWriter<Record> writer = Parquet.writeData(org.apache.iceberg.Files.localOutput(file.toFile()))
+                    .schema(icebergSchema)
+                    .createWriterFunc(GenericParquetWriter::create)
+                    .overwrite()
+                    .withSpec(PartitionSpec.unpartitioned())
+                    .build();
+            try {
+                writer.write(record);
+            } finally {
+                writer.close();
+            }
+            result.put("format", FileFormat.PARQUET.name());
+            result.put("recordCount", 1);
+            result.put("fileBytes", writer.toDataFile().fileSizeInBytes());
+            result.put("ok", true);
+        } catch (Exception ex) {
+            ctx.error("parquet", dryRunError(ex));
+            result.put("ok", false);
+            result.put("error", dryRunError(ex));
+        } finally {
+            if (file != null) {
+                try {
+                    java.nio.file.Files.deleteIfExists(file);
+                } catch (IOException ignored) {
+                    // best effort cleanup
+                }
+            }
+        }
+        return result;
+    }
+
+    private Record toRecord(Types.StructType struct, Object value) {
+        if (value instanceof Struct connectStruct) {
+            GenericRecord record = GenericRecord.create(struct);
+            for (Types.NestedField field : struct.fields()) {
+                record.setField(field.name(), toIcebergValue(field.type(), connectStruct.get(field.name())));
+            }
+            return record;
+        }
+        if (value instanceof Map<?, ?> map) {
+            GenericRecord record = GenericRecord.create(struct);
+            for (Types.NestedField field : struct.fields()) {
+                record.setField(field.name(), toIcebergValue(field.type(), map.get(field.name())));
+            }
+            return record;
+        }
+        throw new IllegalArgumentException(
+                "Top-level sample value must be converted to Connect Struct or Map, but was "
+                        + value.getClass().getName());
+    }
+
+    private Object toIcebergValue(Type type, Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (type.isStructType()) {
+            return toRecord(type.asStructType(), value);
+        }
+        if (type.isListType()) {
+            Type elementType = type.asListType().elementType();
+            if (value instanceof Collection<?> collection) {
+                return collection.stream()
+                        .map(item -> toIcebergValue(elementType, item))
+                        .collect(Collectors.toList());
+            }
+            throw new IllegalArgumentException("Expected collection for list value, but was " + value.getClass());
+        }
+        if (type.isMapType()) {
+            Type keyType = type.asMapType().keyType();
+            Type valueType = type.asMapType().valueType();
+            if (value instanceof Map<?, ?> map) {
+                Map<Object, Object> converted = new LinkedHashMap<>();
+                map.forEach((k, v) -> converted.put(toIcebergValue(keyType, k), toIcebergValue(valueType, v)));
+                return converted;
+            }
+            throw new IllegalArgumentException("Expected map value, but was " + value.getClass());
+        }
+        return toPrimitiveValue(type.asPrimitiveType(), value);
+    }
+
+    private Object toPrimitiveValue(Type.PrimitiveType type, Object value) {
+        return switch (type.typeId()) {
+            case BOOLEAN -> (Boolean) value;
+            case INTEGER -> value instanceof Number number ? number.intValue() : Integer.valueOf(value.toString());
+            case LONG -> value instanceof Number number ? number.longValue() : Long.valueOf(value.toString());
+            case FLOAT -> value instanceof Number number ? number.floatValue() : Float.valueOf(value.toString());
+            case DOUBLE -> value instanceof Number number ? number.doubleValue() : Double.valueOf(value.toString());
+            case DATE -> toLocalDate(value);
+            case TIME -> toLocalTime(value);
+            case TIMESTAMP -> toTimestampValue((Types.TimestampType) type, value);
+            case STRING -> value.toString();
+            case UUID -> value instanceof UUID uuid ? uuid : UUID.fromString(value.toString());
+            case BINARY -> toByteBuffer(value);
+            case FIXED -> value instanceof byte[] bytes ? bytes : toByteBuffer(value).array();
+            case DECIMAL -> value instanceof BigDecimal decimal ? decimal : new BigDecimal(value.toString());
+            default -> value;
+        };
+    }
+
+    private LocalDate toLocalDate(Object value) {
+        if (value instanceof LocalDate localDate) {
+            return localDate;
+        }
+        if (value instanceof java.util.Date date) {
+            return Instant.ofEpochMilli(date.getTime()).atZone(ZoneOffset.UTC).toLocalDate();
+        }
+        if (value instanceof Number number) {
+            return LocalDate.ofEpochDay(number.longValue());
+        }
+        return LocalDate.parse(value.toString());
+    }
+
+    private LocalTime toLocalTime(Object value) {
+        if (value instanceof LocalTime localTime) {
+            return localTime;
+        }
+        if (value instanceof java.util.Date date) {
+            return Instant.ofEpochMilli(date.getTime()).atZone(ZoneOffset.UTC).toLocalTime();
+        }
+        if (value instanceof Number number) {
+            return LocalTime.ofNanoOfDay(number.longValue() * 1000L);
+        }
+        return LocalTime.parse(value.toString());
+    }
+
+    private Object toTimestampValue(Types.TimestampType type, Object value) {
+        if (type.shouldAdjustToUTC()) {
+            if (value instanceof OffsetDateTime offsetDateTime) {
+                return offsetDateTime;
+            }
+            if (value instanceof java.util.Date date) {
+                return Instant.ofEpochMilli(date.getTime()).atOffset(ZoneOffset.UTC);
+            }
+            if (value instanceof Number number) {
+                return Instant.ofEpochMilli(number.longValue()).atOffset(ZoneOffset.UTC);
+            }
+            return OffsetDateTime.parse(value.toString());
+        }
+
+        if (value instanceof LocalDateTime localDateTime) {
+            return localDateTime;
+        }
+        if (value instanceof java.util.Date date) {
+            return Instant.ofEpochMilli(date.getTime()).atZone(ZoneOffset.UTC).toLocalDateTime();
+        }
+        if (value instanceof Number number) {
+            return Instant.ofEpochMilli(number.longValue()).atZone(ZoneOffset.UTC).toLocalDateTime();
+        }
+        return LocalDateTime.parse(value.toString());
+    }
+
+    private ByteBuffer toByteBuffer(Object value) {
+        if (value instanceof ByteBuffer byteBuffer) {
+            return byteBuffer;
+        }
+        if (value instanceof byte[] bytes) {
+            return ByteBuffer.wrap(bytes);
+        }
+        return ByteBuffer.wrap(value.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    private Record dummyRecord(Types.StructType struct) {
+        GenericRecord record = GenericRecord.create(struct);
+        for (Types.NestedField field : struct.fields()) {
+            record.setField(field.name(), dummyValue(field.type()));
+        }
+        return record;
+    }
+
+    private Object dummyValue(Type type) {
+        if (type.isStructType()) {
+            return dummyRecord(type.asStructType());
+        }
+        if (type.isListType()) {
+            return List.of();
+        }
+        if (type.isMapType()) {
+            return Map.of();
+        }
+
+        return switch (type.typeId()) {
+            case BOOLEAN -> false;
+            case INTEGER -> 0;
+            case LONG -> 0L;
+            case FLOAT -> 0.0F;
+            case DOUBLE -> 0.0D;
+            case DATE -> LocalDate.ofEpochDay(0);
+            case TIME -> LocalTime.MIDNIGHT;
+            case TIMESTAMP -> {
+                Types.TimestampType timestampType = (Types.TimestampType) type.asPrimitiveType();
+                yield timestampType.shouldAdjustToUTC()
+                        ? OffsetDateTime.ofInstant(Instant.EPOCH, ZoneOffset.UTC)
+                        : LocalDateTime.ofInstant(Instant.EPOCH, ZoneOffset.UTC);
+            }
+            case STRING -> "";
+            case UUID -> new UUID(0L, 0L);
+            case BINARY -> ByteBuffer.wrap(new byte[0]);
+            case FIXED -> new byte[((Types.FixedType) type.asPrimitiveType()).length()];
+            case DECIMAL -> BigDecimal.ZERO.setScale(((Types.DecimalType) type.asPrimitiveType()).scale());
+            default -> null;
+        };
+    }
+
+    private Map<String, Object> converterConfig(Map<String, Object> requestConfig) {
+        if (requestConfig == null || requestConfig.isEmpty()) {
+            return Map.of();
+        }
+
+        Map<String, Object> normalized = new LinkedHashMap<>();
+        requestConfig.forEach((key, value) -> {
+            if (key != null && key.startsWith(VALUE_CONVERTER_PREFIX)) {
+                normalized.put(key.substring(VALUE_CONVERTER_PREFIX.length()), value);
+            } else if (key != null) {
+                normalized.put(key, value);
+            }
+        });
+        return normalized;
+    }
+
+    private String sampleFormat(SchemaCheckRequest request, String defaultFormat) {
+        if (isBlank(request.sampleFormat()) || "auto".equalsIgnoreCase(request.sampleFormat())) {
+            return defaultFormat;
+        }
+        return request.sampleFormat().trim().toLowerCase();
     }
 
     private String normalizeFormat(String format) {
         return format == null ? "" : format.trim().toLowerCase();
     }
 
+    private String dryRunError(Exception ex) {
+        String message = ex.getMessage();
+        return ex.getClass().getSimpleName() + (message == null ? "" : ": " + message);
+    }
+
+    private boolean isBlank(String value) {
+        return value == null || value.trim().isEmpty();
+    }
+
     private Map<String, Object> schemaToMap(Schema schema) {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("schemaId", schema.schemaId());
-        result.put("fields", fieldsToMap(schema.columns()));
+        result.put("fields", icebergFieldsToMap(schema.columns()));
         return result;
     }
 
-    private List<Map<String, Object>> fieldsToMap(List<Types.NestedField> fields) {
+    private List<Map<String, Object>> icebergFieldsToMap(List<Types.NestedField> fields) {
         List<Map<String, Object>> mapped = new ArrayList<>();
         for (Types.NestedField field : fields) {
             Map<String, Object> item = new LinkedHashMap<>();
             item.put("id", field.fieldId());
             item.put("name", field.name());
             item.put("required", field.isRequired());
-            item.put("type", typeToMap(field.type()));
+            item.put("type", icebergTypeToMap(field.type()));
             mapped.add(item);
         }
         return mapped;
     }
 
-    private Object typeToMap(Type type) {
+    private Object icebergTypeToMap(Type type) {
         if (type.isPrimitiveType()) {
             return type.toString();
         }
         if (type.isStructType()) {
             Map<String, Object> result = new LinkedHashMap<>();
             result.put("type", "struct");
-            result.put("fields", fieldsToMap(type.asStructType().fields()));
+            result.put("fields", icebergFieldsToMap(type.asStructType().fields()));
             return result;
         }
         if (type.isListType()) {
@@ -293,7 +555,7 @@ public class SchemaCheckerService {
             result.put("type", "list");
             result.put("elementId", type.asListType().elementId());
             result.put("elementRequired", type.asListType().isElementRequired());
-            result.put("element", typeToMap(type.asListType().elementType()));
+            result.put("element", icebergTypeToMap(type.asListType().elementType()));
             return result;
         }
         if (type.isMapType()) {
@@ -302,11 +564,46 @@ public class SchemaCheckerService {
             result.put("keyId", type.asMapType().keyId());
             result.put("valueId", type.asMapType().valueId());
             result.put("valueRequired", type.asMapType().isValueRequired());
-            result.put("key", typeToMap(type.asMapType().keyType()));
-            result.put("value", typeToMap(type.asMapType().valueType()));
+            result.put("key", icebergTypeToMap(type.asMapType().keyType()));
+            result.put("value", icebergTypeToMap(type.asMapType().valueType()));
             return result;
         }
         return type.toString();
+    }
+
+    private Map<String, Object> connectSchemaToMap(org.apache.kafka.connect.data.Schema schema) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("type", schema.type().name());
+        result.put("optional", schema.isOptional());
+        if (schema.name() != null) {
+            result.put("name", schema.name());
+        }
+        if (schema.version() != null) {
+            result.put("version", schema.version());
+        }
+        if (schema.parameters() != null && !schema.parameters().isEmpty()) {
+            result.put("parameters", schema.parameters());
+        }
+        if (schema.type() == org.apache.kafka.connect.data.Schema.Type.STRUCT) {
+            result.put("fields", schema.fields().stream()
+                    .map(field -> {
+                        Map<String, Object> item = new LinkedHashMap<>();
+                        item.put("name", field.name());
+                        item.put("index", field.index());
+                        item.put("schema", connectSchemaToMap(field.schema()));
+                        return item;
+                    })
+                    .collect(Collectors.toList()));
+        } else if (schema.type() == org.apache.kafka.connect.data.Schema.Type.ARRAY) {
+            result.put("valueSchema", connectSchemaToMap(schema.valueSchema()));
+        } else if (schema.type() == org.apache.kafka.connect.data.Schema.Type.MAP) {
+            result.put("keySchema", connectSchemaToMap(schema.keySchema()));
+            result.put("valueSchema", connectSchemaToMap(schema.valueSchema()));
+        }
+        return result;
+    }
+
+    private record ConnectInput(org.apache.kafka.connect.data.Schema schema, Object value) {
     }
 
     private static final class CheckContext {
@@ -326,5 +623,4 @@ public class SchemaCheckerService {
             warnings.add(new SchemaIssue(path, message));
         }
     }
-
 }

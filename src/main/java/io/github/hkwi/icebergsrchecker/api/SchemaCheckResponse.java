@@ -9,6 +9,8 @@ public record SchemaCheckResponse(
         long elapsedMs,
         List<SchemaIssue> errors,
         List<SchemaIssue> warnings,
-        Map<String, Object> icebergSchema
+        Map<String, Object> connectSchema,
+        Map<String, Object> icebergSchema,
+        Map<String, Object> parquetDryRun
 ) {
 }

@@ -4,10 +4,9 @@
   --ink: #1f2228;
   --muted: #5b606d;
   --accent: #0e8f83;
-  --accent-2: #ef6f43;
   --ok: #0f7b46;
   --ng: #9f2f22;
-  --panel: rgba(255, 255, 255, 0.82);
+  --panel: rgba(255, 255, 255, 0.86);
   --border: rgba(30, 35, 40, 0.15);
   --shadow: 0 14px 40px rgba(31, 34, 40, 0.12);
 }
@@ -28,11 +27,9 @@ body {
   position: fixed;
   inset: 0;
   background-image:
-    radial-gradient(circle at 10% 10%, rgba(14, 143, 131, 0.14) 0 14%, transparent 42%),
-    radial-gradient(circle at 85% 20%, rgba(239, 111, 67, 0.18) 0 18%, transparent 45%),
     linear-gradient(rgba(31, 34, 40, 0.04) 1px, transparent 1px),
     linear-gradient(90deg, rgba(31, 34, 40, 0.04) 1px, transparent 1px);
-  background-size: auto, auto, 28px 28px, 28px 28px;
+  background-size: 28px 28px, 28px 28px;
   pointer-events: none;
 }
 
@@ -43,13 +40,11 @@ body {
   gap: 18px;
   position: relative;
   z-index: 1;
-  animation: reveal 420ms ease-out;
 }
 
 .hero h1 {
   margin: 0;
   font-size: clamp(1.8rem, 4vw, 3rem);
-  letter-spacing: -0.03em;
 }
 
 .eyebrow {
@@ -64,13 +59,13 @@ body {
 .sub {
   margin: 10px 0 0;
   color: var(--muted);
-  max-width: 70ch;
+  max-width: 76ch;
 }
 
 .panel {
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 18px;
+  border-radius: 8px;
   box-shadow: var(--shadow);
   backdrop-filter: blur(5px);
   padding: 18px;
@@ -81,21 +76,38 @@ form {
   gap: 10px;
 }
 
-.controls {
+.controls,
+.actions,
+.result-header {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
   gap: 10px;
 }
 
-label {
+.controls {
+  flex-wrap: wrap;
+}
+
+.actions,
+.result-header {
+  justify-content: space-between;
+}
+
+label,
+summary {
   font-weight: 600;
+}
+
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 select,
 textarea,
 button {
-  border-radius: 10px;
+  border-radius: 8px;
   border: 1px solid var(--border);
   font-family: inherit;
   font-size: 0.95rem;
@@ -113,16 +125,21 @@ textarea {
   padding: 12px;
   font-family: "IBM Plex Mono", monospace;
   line-height: 1.45;
-  background: rgba(255, 255, 255, 0.85);
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.optional-grid {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.optional-grid textarea {
+  min-height: 130px;
 }
 
 button {
   cursor: pointer;
-  transition: transform 140ms ease, box-shadow 140ms ease;
-}
-
-button:hover {
-  transform: translateY(-1px);
 }
 
 .primary {
@@ -130,17 +147,6 @@ button:hover {
   color: #fff;
   background: linear-gradient(90deg, var(--accent), #1ca190);
   box-shadow: 0 8px 18px rgba(14, 143, 131, 0.32);
-}
-
-.actions {
-  display: flex;
-  justify-content: flex-end;
-}
-
-.result-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
 }
 
 .result h2 {
@@ -169,9 +175,9 @@ button:hover {
 
 pre {
   margin: 0;
-  max-height: 420px;
+  max-height: 480px;
   overflow: auto;
-  border-radius: 10px;
+  border-radius: 8px;
   padding: 12px;
   background: #141a22;
   color: #e9eef9;
@@ -196,16 +202,5 @@ pre {
 
   .primary {
     width: 100%;
-  }
-}
-
-@keyframes reveal {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
   }
 }
