@@ -1,75 +1,80 @@
-# Iceberg Schema Pre-check (Java)
+# Iceberg Schema Pre-check
 
-## Why This Exists
+This application checks whether a Schema Registry schema can pass through the
+same broad path used by the Iceberg Kafka Connect sink before data is persisted
+as Parquet.
 
-Schema evolution is useful, but the most important mismatch is between two different schema models:
+The default check does not require a sample value. It converts the source schema
+to a Kafka Connect schema, maps that schema to an Iceberg schema, synthesizes a
+minimal Iceberg record, and writes one temporary Parquet file.
 
-- Schema Registry model: designed to validate and store schemas by format (Avro / JSON Schema / Protobuf)
-- Iceberg model: designed around Iceberg table types and file-format-oriented constraints
+## What This Tool Checks
 
-A schema can be fully valid in Schema Registry and still fail when the Iceberg Kafka Connect Sink maps it into Iceberg/Parquet types.
-Language-level expressiveness differences matter, but this tool prioritizes the Registry-to-Iceberg model gap.
+- Schema Registry schema parsing for Avro, JSON Schema, and Protobuf.
+- Confluent schema-to-Kafka-Connect schema conversion.
+- Kafka Connect schema-to-Iceberg schema conversion using Iceberg sink-style
+  rules.
+- Parquet writer construction and one-record write using Iceberg's Parquet
+  writer.
 
-This project exists to catch those failures early.
-Instead of discovering issues at runtime in a connector task, you can paste a schema into a web UI and run a pre-check.
+The response includes the Connect schema view, the mapped Iceberg schema view,
+and the Parquet dry-run result.
 
-## What This Tool Does
+## Sample Values
 
-This is a web application that validates whether a schema is likely to be convertible for Iceberg sink usage.
+Sample values are optional.
 
-- Input formats: Avro, JSON Schema, Protobuf
-- Output: pass/fail, warnings, errors, and a mapped Iceberg-style schema view
-- Goal: fail fast during design/review, before deployment
+When `sampleValue` is omitted, the checker writes a synthetic record generated
+from the mapped Iceberg schema. This is the recommended default for Avro and
+Protobuf because their JSON value encodings are easy to get wrong.
 
-## Design Principles
+When `sampleValue` is provided, `sampleFormat` selects the value parser:
 
-- Start with official libraries where possible.
-- Focus checks on Schema Registry semantics vs Iceberg semantics.
-- Keep checks practical for pre-validation, not a perfect emulator of every connector edge case.
-- Show actionable diagnostics (path + message), not only a boolean result.
+- Avro: Avro JSON encoding parsed with Avro's `GenericDatumReader`.
+- JSON Schema: ordinary JSON passed through Confluent `JsonSchemaData`.
+- Protobuf: Protobuf JSON or Protobuf TextFormat parsed into `DynamicMessage`.
 
-## Technical Stack
+This validates both the schema path and the provided sample data path.
 
-- Spring Boot (Web)
-- Confluent Schema Registry libraries
-  - io.confluent:kafka-avro-serializer
-  - io.confluent:kafka-json-schema-serializer
-  - io.confluent:kafka-protobuf-serializer
-- Apache Iceberg
-  - org.apache.iceberg:iceberg-core
-  - org.apache.iceberg:iceberg-parquet
+## Request Shape
 
-## How Conversion Is Checked
+```json
+{
+  "format": "json-schema",
+  "schema": "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}}}",
+  "schemaForceOptional": false,
+  "converterConfig": {
+    "use.optional.for.nonrequired": true
+  },
+  "sampleFormat": "json",
+  "sampleValue": "{\"id\":\"A-1\"}"
+}
+```
 
-- Avro: parsed by Confluent Avro classes, then converted to Iceberg via AvroSchemaUtil.
-- JSON Schema: parsed and validated, then mapped to Iceberg-compatible types with rule-based checks.
-- Protobuf: parsed into descriptors, then mapped to Iceberg-compatible types with rule-based checks.
+`converterConfig` also accepts keys with the `value.converter.` prefix; the
+prefix is stripped before passing the config to Confluent data conversion
+classes.
 
 ## Quick Start
 
-1. Run the application:
+```sh
+mvn spring-boot:run
+```
 
-   mvn spring-boot:run
+Open the UI:
 
-2. Open the UI:
-
-   http://localhost:8080
-
-3. Paste a schema, select format, and submit.
+```text
+http://localhost:8080
+```
 
 ## Docker
 
-1. Build image:
+```sh
+docker build -t your-registry/iceberg-sr-checker:latest .
+docker push your-registry/iceberg-sr-checker:latest
+```
 
-   docker build -t your-registry/iceberg-sr-checker:latest .
-
-2. Push image:
-
-   docker push your-registry/iceberg-sr-checker:latest
-
-### Tips: Building Behind a Proxy
-
-When building in an environment that requires a proxy, pass the proxy settings as build arguments:
+### Building Behind a Proxy
 
 ```sh
 docker build \
@@ -81,15 +86,18 @@ docker build \
   -t your-registry/iceberg-sr-checker:latest .
 ```
 
-`-Dmaven.resolver.transport=jdk` is not supported by the Maven image used here. Maven fails at startup with `Unknown resolver transport 'jdk'. Supported transports are: wagon, native, auto`.
-
 ## Testing
 
-Run tests with:
-
+```sh
 mvn test
+```
 
-## Scope and Limitations
+## Scope And Limitations
 
-This tool is a pre-check utility.
-It is intentionally designed to identify common Registry-to-Iceberg incompatibilities early, but it does not guarantee perfect behavior parity with every production connector configuration.
+This is a local dry-run utility, not a replacement for a running Kafka Connect
+task. It does not deserialize Confluent wire-format Kafka payloads or contact a
+real Schema Registry. It checks the schema/data conversion path and temporary
+Parquet write path inside the process.
+
+Existing table compatibility and schema evolution against a live Iceberg catalog
+are not checked unless those inputs are added to the API in the future.

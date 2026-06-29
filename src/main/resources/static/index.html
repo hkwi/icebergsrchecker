@@ -17,10 +17,10 @@
     <main class="app-shell">
       <section class="hero">
         <p class="eyebrow">Iceberg Kafka Connect Sink</p>
-        <h1>Schema Conversion Pre-check</h1>
+        <h1>Parquet Dry-run Pre-check</h1>
         <p class="sub">
-          Avro / JSON Schema / Protobuf を貼り付け、Confluent + Iceberg ライブラリを使って
-          変換可能性を判定します。
+          Schema Registry の schema を Kafka Connect schema に変換し、Iceberg schema と
+          Parquet writer まで dry-run します。
         </p>
       </section>
 
@@ -33,11 +33,35 @@
               <option value="json-schema">JSON Schema</option>
               <option value="protobuf">Protobuf</option>
             </select>
+            <label class="check">
+              <input type="checkbox" id="schema-force-optional" />
+              schema-force-optional
+            </label>
             <button type="button" id="example-btn">Load Example</button>
           </div>
 
           <label for="schema">Schema</label>
           <textarea id="schema" name="schema" spellcheck="false" required></textarea>
+
+          <details>
+            <summary>Optional value/config</summary>
+            <div class="optional-grid">
+              <label for="sample-format">Sample format</label>
+              <select id="sample-format">
+                <option value="auto">Auto</option>
+                <option value="avro-json">Avro JSON</option>
+                <option value="json">JSON</option>
+                <option value="protobuf-json">Protobuf JSON</option>
+                <option value="protobuf-text">Protobuf TextFormat</option>
+              </select>
+
+              <label for="sample-value">Sample value</label>
+              <textarea id="sample-value" spellcheck="false"></textarea>
+
+              <label for="converter-config">Converter config JSON</label>
+              <textarea id="converter-config" spellcheck="false">{}</textarea>
+            </div>
+          </details>
 
           <div class="actions">
             <button type="submit" class="primary">Submit</button>
