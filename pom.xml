@@ -22,7 +22,7 @@
         <confluent.version>8.3.0</confluent.version>
         <iceberg.version>1.11.0</iceberg.version>
         <kafka.version>8.3.0-ccs</kafka.version>
-        <parquet.version>1.17.1</parquet.version>
+        <parquet.version>1.18.0</parquet.version>
         <hadoop.version>3.3.0</hadoop.version>
     </properties>
 
